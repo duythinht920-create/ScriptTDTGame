@@ -51,7 +51,6 @@ local RARITY_RANK = {
 }
 
 local OPTION_ALIASES = {
-    AutoStealAll = "HopValue",
     AutoEquipBestPets = "ResolvePlot",
     AutoServerHop = "1289",
     HopThreshold = "921",
@@ -61,9 +60,19 @@ local Modules = {}
 local carrying = false
 local running = false
 local lastTaskRun = {}
+local moveTarget = nil
+local debugEnabled = function()
+    return getgenv and getgenv().TDT_FARM_DEBUG == true
+end
 
 local function log(msg)
     print("[TDT Farm]", msg)
+end
+
+local function debugLog(msg)
+    if debugEnabled() then
+        print("[TDT Farm DEBUG]", msg)
+    end
 end
 
 local function loadModules()
@@ -73,21 +82,20 @@ local function loadModules()
     Modules.loaded = true
 
     local ok, err = pcall(function()
-        local shared = ReplicatedStorage:WaitForChild("Shared", 20)
-        local client = shared:WaitForChild("Client", 20)
+        local root = ReplicatedStorage:WaitForChild("Shared", 25)
+        local client = root:WaitForChild("Client", 25)
         Modules.EggState = require(client:WaitForChild("EggState"))
-        Modules.Constants = require(shared:WaitForChild("Globals"):WaitForChild("Constants"))
-        pcall(function()
-            Modules.Eggs = require(shared:WaitForChild("Types"):WaitForChild("Eggs"))
-        end)
-        pcall(function()
-            Modules.Save = require(shared:WaitForChild("Save"))
-        end)
-        pcall(function()
-            Modules.BaseUpgrade = require(client:WaitForChild("BaseUpgrade"))
-        end)
-        Modules.AreaEggClient = ReplicatedStorage:FindFirstChild("AreaEggSlotsClient")
-            or client:FindFirstChild("AreaEggSlotsClient")
+        Modules.BaseUpgrade = require(client:WaitForChild("BaseUpgrade"))
+
+        local inner = root:FindFirstChild("Shared") or root
+        Modules.Constants = require(inner:WaitForChild("Globals"):WaitForChild("Constants"))
+        Modules.Eggs = require(inner:WaitForChild("Types"):WaitForChild("Eggs"))
+        Modules.Save = require(inner:WaitForChild("Save"))
+
+        local slotMod = client:FindFirstChild("AreaEggSlotsClient")
+        if slotMod and slotMod:IsA("ModuleScript") then
+            Modules.AreaEggClient = require(slotMod)
+        end
     end)
 
     Modules.ok = ok
@@ -116,6 +124,9 @@ function TDTStealEggLogic.setOption(key, value)
     local id = OPTION_ALIASES[key] or key
     Config[id] = value
     Config[key] = value
+    if key == "AutoStealAll" or key == "AutoStealSelected" then
+        debugLog(string.format("Steal toggle %s = %s | enabled = %s", key, tostring(value), tostring(stealingEnabled())))
+    end
 end
 
 function TDTStealEggLogic.getConfig()
@@ -137,7 +148,24 @@ local function getHumanoid()
 end
 
 local function stealingEnabled()
-    return Config.AutoStealSelected == true or Config.AutoStealAll == true or Config.HopValue == true
+    return Config.AutoStealSelected == true or Config.AutoStealAll == true
+end
+
+local function syncCarryingState()
+    pcall(function()
+        if Modules.EggState then
+            if Modules.EggState.GetCarryState then
+                local state = Modules.EggState.GetCarryState()
+                if type(state) == "table" then
+                    carrying = state.IsCarrying == true
+                    return
+                end
+            end
+            if Modules.EggState.IsCarrying then
+                carrying = Modules.EggState.IsCarrying() == true
+            end
+        end
+    end)
 end
 
 local function placingEnabled()
@@ -169,13 +197,78 @@ local function flattenEggs(data)
 end
 
 local function readFieldEggs()
+    syncFieldEggs()
     local ok, data = pcall(function()
         return Modules.EggState.ReadFieldEggs()
     end)
     if ok and type(data) == "table" then
-        return flattenEggs(data)
+        local list = flattenEggs(data)
+        debugLog("Field eggs found: " .. tostring(#list))
+        return list
     end
+    debugLog("ReadFieldEggs failed or empty")
     return {}
+end
+
+local function findEggInWorld(uid)
+    if type(uid) ~= "string" or uid == "" then
+        return nil
+    end
+    local objects = Workspace:FindFirstChild("__OBJECTS")
+    if not objects then
+        return nil
+    end
+    for _, inst in ipairs(objects:GetDescendants()) do
+        if inst:IsA("BasePart") or inst:IsA("Model") then
+            local match = inst:GetAttribute("Uid") or inst:GetAttribute("UID") or inst:GetAttribute("EggUid")
+            if match == uid then
+                if inst:IsA("Model") then
+                    return inst:GetPivot().Position
+                end
+                return inst.Position
+            end
+            if inst.Name == uid then
+                if inst:IsA("Model") then
+                    return inst:GetPivot().Position
+                elseif inst:IsA("BasePart") then
+                    return inst.Position
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function resolveAreaPosition(areaId, slotId)
+    local areas = Workspace:FindFirstChild("__OBJECTS")
+    areas = areas and areas:FindFirstChild("Areas")
+    if not areas or type(areaId) ~= "string" then
+        return nil
+    end
+    local area = areas:FindFirstChild(areaId)
+    if not area then
+        return nil
+    end
+    if slotId then
+        local slot = area:FindFirstChild(tostring(slotId), true)
+            or area:FindFirstChild("Slot" .. tostring(slotId), true)
+        if slot then
+            if slot:IsA("BasePart") then
+                return slot.Position
+            elseif slot:IsA("Model") then
+                return slot:GetPivot().Position
+            end
+            local part = slot:FindFirstChildWhichIsA("BasePart", true)
+            if part then
+                return part.Position
+            end
+        end
+    end
+    if area:IsA("BasePart") then
+        return area.Position
+    end
+    local part = area:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position
 end
 
 local function resolveRarity(assetCategory)
@@ -217,7 +310,12 @@ local function eggInventoryFull()
     if not Modules.Save then
         return false
     end
-    local ok, save = pcall(Modules.Save.ReadSnapshot)
+    local ok, save = pcall(function()
+        if Modules.Save.ReadSnapshot then
+            return Modules.Save.ReadSnapshot()
+        end
+        return Modules.Save.ReadSnapshot
+    end)
     if not ok or type(save) ~= "table" then
         return false
     end
@@ -244,21 +342,37 @@ local function getEggPosition(record)
     if typeof(record.WorldPosition) == "Vector3" then
         return record.WorldPosition
     end
-    local areas = Workspace:FindFirstChild("__OBJECTS")
-    areas = areas and areas:FindFirstChild("Areas")
-    if areas and record.AreaId then
-        local area = areas:FindFirstChild(record.AreaId)
-        if area then
-            if area:IsA("BasePart") then
-                return area.Position
+    if typeof(record.CFrame) == "CFrame" then
+        return record.CFrame.Position
+    end
+
+    local uid = record.Uid or record.uid or record.ID
+    if Modules.AreaEggClient then
+        local ok, pos = pcall(function()
+            if Modules.AreaEggClient.GetSlotPosition then
+                return Modules.AreaEggClient.GetSlotPosition(uid)
             end
-            local part = area:FindFirstChildWhichIsA("BasePart", true)
-            if part then
-                return part.Position
+            if Modules.AreaEggClient.GetWorldPosition then
+                return Modules.AreaEggClient.GetWorldPosition(record)
             end
+            if Modules.AreaEggClient.FindRecord and uid then
+                local enriched = Modules.AreaEggClient.FindRecord(uid)
+                if type(enriched) == "table" then
+                    return getEggPosition(enriched)
+                end
+            end
+        end)
+        if ok and typeof(pos) == "Vector3" then
+            return pos
         end
     end
-    return nil
+
+    local worldPos = findEggInWorld(uid)
+    if worldPos then
+        return worldPos
+    end
+
+    return resolveAreaPosition(record.AreaId, record.SlotId or record.Slot or record.Index)
 end
 
 local function scoreEgg(record, rootPos)
@@ -324,7 +438,7 @@ local function moveTo(position)
     end
 
     if speed >= 80 then
-        local step = math.min(dist, speed * 0.03)
+        local step = math.min(dist, math.max(speed * 0.05, 12))
         root.CFrame = CFrame.new(root.Position + delta.Unit * step)
         if Config.NoClip then
             for _, part in ipairs(getCharacter():GetDescendants()) do
@@ -337,7 +451,7 @@ local function moveTo(position)
         hum:MoveTo(position)
     end
 
-    return (root.Position - position).Magnitude <= 10
+    return (root.Position - position).Magnitude <= 12
 end
 
 local function getRespawnPosition()
@@ -388,36 +502,51 @@ local function tryHatch(uid)
 end
 
 local function runAutoSteal()
+    syncCarryingState()
     if not stealingEnabled() or carrying or eggInventoryFull() then
         return false
     end
 
-    syncFieldEggs()
     local records = readFieldEggs()
+    if #records == 0 then
+        debugLog("No eggs in snapshot")
+        return false
+    end
+
     local target = pickEgg(records)
     if not target then
+        debugLog("No egg with valid position")
         return false
     end
 
+    local uid = target.Uid or target.uid or target.ID
     local pos = getEggPosition(target)
     if not pos then
+        debugLog("Missing position for egg " .. tostring(uid))
         return false
     end
 
-    if not moveTo(pos) then
+    moveTarget = uid
+    local arrived = moveTo(pos)
+    if not arrived then
+        debugLog("Moving to egg " .. tostring(uid))
         return false
     end
 
-    local uid = target.Uid or target.uid
     if tryCarry(target) then
         log("Steal egg: " .. tostring(uid))
+        moveTarget = nil
         task.wait(0.55)
+        syncCarryingState()
         return true
     end
+
+    debugLog("CarryFieldEgg failed for " .. tostring(uid))
     return false
 end
 
 local function runReturnBase()
+    syncCarryingState()
     if not carrying or not Config.AutoReturn then
         return false
     end
@@ -439,7 +568,12 @@ local function runAutoPlace()
     if not Modules.Save then
         return false
     end
-    local ok, save = pcall(Modules.Save.ReadSnapshot)
+    local ok, save = pcall(function()
+        if Modules.Save.ReadSnapshot then
+            return Modules.Save.ReadSnapshot()
+        end
+        return Modules.Save.ReadSnapshot
+    end)
     if not ok or type(save) ~= "table" or type(save.EggInventory) ~= "table" then
         return false
     end
@@ -455,7 +589,12 @@ local function runAutoHatch()
     if not Config.AutoOpenReadyEggs or not Modules.Save then
         return false
     end
-    local ok, save = pcall(Modules.Save.ReadSnapshot)
+    local ok, save = pcall(function()
+        if Modules.Save.ReadSnapshot then
+            return Modules.Save.ReadSnapshot()
+        end
+        return Modules.Save.ReadSnapshot
+    end)
     if not ok or type(save) ~= "table" then
         return false
     end
@@ -495,6 +634,7 @@ local TASK_ORDER = { "Auto Steal Egg", "Auto Return", "Auto Drop", "Auto Place E
 
 local function priorityLoop()
     while running do
+        syncCarryingState()
         for _, name in ipairs(TASK_ORDER) do
             local taskDef = TASKS[name]
             if taskDef then
@@ -521,13 +661,30 @@ function TDTStealEggLogic.start()
         return true
     end
     if not loadModules() then
+        warn("[TDT Farm] Khong load duoc game modules — ban co dang o game Steal an Egg khong?")
         return false
     end
     bindCarryEvent()
+    syncCarryingState()
     running = true
     task.spawn(priorityLoop)
-    log("Farm loop started.")
+    log("Farm loop started. Bat Auto Steal All de chay.")
+    if debugEnabled() then
+        local testEggs = readFieldEggs()
+        log("Debug: " .. tostring(#testEggs) .. " eggs in field snapshot")
+    end
     return true
+end
+
+function TDTStealEggLogic.status()
+    return {
+        running = running,
+        modulesOk = Modules.ok == true,
+        carrying = carrying,
+        stealEnabled = stealingEnabled(),
+        config = Config,
+        moveTarget = moveTarget,
+    }
 end
 
 function TDTStealEggLogic.stop()
